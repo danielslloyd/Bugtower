@@ -36,28 +36,10 @@
 
     <hr/>
     <h2 style="font-size:14px;margin-top:8px;">Selected Fire Control Tower</h2>
-    <div class="muted">Select a placed fire-control tower (click it) to edit its plane path.</div>
-
-    <label>Path Type</label>
-    <select id="path-type">
-      <option value="linear">Linear (x = a t + b, y = c t + d)</option>
-      <option value="hyperbola">Hyperbolic (rectangular-style param)</option>
-      <option value="ellipse">Ellipse (parametric)</option>
-      <option value="sinusoid">Sinusoidal (y = A sin(k t + φ) + c)</option>
-    </select>
+    <div class="muted">Fire equation: y = ax + b</div>
 
     <div id="path-params" style="margin-top:8px;">
       <!-- Dynamic parameter inputs will be injected here -->
-    </div>
-
-    <div style="margin-top:8px;" class="row">
-      <div class="button" id="btn-validate">Validate Parameters</div>
-      <div class="button" id="btn-confirm">Confirm Path</div>
-    </div>
-
-    <div style="margin-top:8px;" class="row">
-      <div class="button" id="btn-launch">Launch Strike</div>
-      <div class="muted" id="launch-status"></div>
     </div>
 
     <hr/>
@@ -222,7 +204,7 @@ function spawnPlane(pathFunc, t0=0, lifetime=10, towerRef=null) {
   return p;
 }
 function spawnBomb(x,y,damage=CONFIG.bombDamage, radius=CONFIG.bombRadius) {
-  World.bombs.push({ id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6 }); // short explosion life
+  World.bombs.push({ id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6, maxLife: 0.6 }); // short explosion life
 }
 
 // ---------- Path templates and parameter handling ----------
@@ -261,6 +243,14 @@ function makePathEllipse(a,b,h,k,tmin=0,tmax=undefined) {
 function makePathSinusoid(A,k,phi,c,tmin=-10,tmax=10) {
   return {
     positionAt: (t) => ({ x: t, y: A*Math.sin(k*t + phi) + c }),
+    tmin, tmax
+  };
+}
+
+// Simple linear path: y = ax + b (where x=t, y=at+b)
+function makePathSimple(a, b, tmin=-10, tmax=10) {
+  return {
+    positionAt: (t) => ({ x: t, y: a*t + b }),
     tmin, tmax
   };
 }
@@ -453,6 +443,28 @@ function gameTick(dt) {
   for (let ds of World.deathSpots) ds.amount = Math.max(0, ds.amount - dt*0.02);
   // update harvesters
   for (let h of World.harvesters) updateHarvester(h, dt);
+
+  // Auto-launch from fire control towers every 10 seconds
+  for (let s of World.structures) {
+    if (s.type === 'fire-control' && s.meta.path && s.meta.path.func) {
+      if (!s.meta.launchTimer) s.meta.launchTimer = 0;
+      s.meta.launchTimer += dt;
+      if (s.meta.launchTimer >= 10) {
+        s.meta.launchTimer = 0;
+        // Launch a plane
+        const pf = s.meta.path.func;
+        const wrapper = {
+          positionAt: (t) => {
+            const p = pf.positionAt(t);
+            return { x: p.x + s.x, y: p.y + s.y };
+          },
+          tmin: pf.tmin, tmax: pf.tmax
+        };
+        spawnPlane(wrapper, 0, 12, s.id);
+        log('Auto-launched from tower at (' + s.x + ', ' + s.y + ')');
+      }
+    }
+  }
   // planes
   for (let p of World.planes) {
     if (!p.alive) continue;
@@ -540,6 +552,30 @@ function renderEntities() {
     const tl = worldToScreen(s.x - s.w/2, s.y + s.h/2);
     const br = worldToScreen(s.x + s.w/2, s.y - s.h/2);
     const w = br.x - tl.x, h = br.y - tl.y;
+
+    // Draw halo if this tower is selected
+    const isSelected = (s === selectedTower && s.type === 'fire-control');
+    if (isSelected) {
+      const center = worldToScreen(s.x, s.y);
+      const haloRadius = Math.max(w, h) * 0.8;
+
+      // Draw glowing halo effect
+      ctx.save();
+      ctx.globalAlpha = 0.3;
+      ctx.fillStyle = '#00ff66';
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, haloRadius, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = '#00ff66';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, haloRadius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     if (s.type === 'fire-control') {
       ctx.fillStyle = '#2b70d6';
       ctx.fillRect(tl.x, tl.y, w, h);
@@ -590,33 +626,66 @@ function renderEntities() {
     ctx.restore();
   }
 
-  // planes
+  // planes (rendered as stars)
   for (let p of World.planes) {
     const pos = p.pathFunc.positionAt(p.t);
     const sc = worldToScreen(pos.x, pos.y);
-    ctx.fillStyle = '#fff';
+
+    // Draw star sprite
+    ctx.save();
+    ctx.translate(sc.x, sc.y);
+    ctx.fillStyle = '#ffff00';
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+
+    // Draw a 5-pointed star
     ctx.beginPath();
-    ctx.arc(sc.x, sc.y, 5, 0, Math.PI*2);
-    ctx.fill();
-    // show projected path small dots for clarity
-    ctx.fillStyle = 'rgba(255,255,255,0.12)';
-    for (let s=0;s<12;s++) {
-      const tt = p.t + (s+1)*0.5;
-      try {
-        const pp = p.pathFunc.positionAt(tt);
-        const scc = worldToScreen(pp.x, pp.y);
-        ctx.fillRect(scc.x-2, scc.y-2, 3,3);
-      } catch(e){}
+    for (let i = 0; i < 5; i++) {
+      const angle = (i * 4 * Math.PI / 5) - Math.PI / 2;
+      const radius = i % 2 === 0 ? 8 : 3;
+      const x = Math.cos(angle) * radius;
+      const y = Math.sin(angle) * radius;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
   }
 
-  // bombs (visual)
+  // bombs (expanding/collapsing explosion circles)
   for (let b of World.bombs) {
     const sc = worldToScreen(b.x, b.y);
+
+    // Calculate animation progress (0 to 1)
+    const progress = 1 - (b.life / b.maxLife);
+
+    // Expand then collapse: use sine wave
+    // 0 -> 0.5: expand from 0 to max
+    // 0.5 -> 1: collapse from max to 0
+    let scale;
+    if (progress < 0.5) {
+      scale = progress * 2; // 0 to 1
+    } else {
+      scale = 2 - (progress * 2); // 1 to 0
+    }
+
+    const currentRadius = b.radius * CONFIG.gridSizePx * scale;
+    const opacity = 0.8 * (1 - progress * 0.5); // fade out slightly
+
+    // Draw explosion circle
     ctx.beginPath();
-    ctx.fillStyle = 'rgba(255,120,20,0.9)';
-    ctx.arc(sc.x, sc.y, Math.max(3, b.radius * CONFIG.gridSizePx*0.8), 0, Math.PI*2);
+    ctx.fillStyle = `rgba(255, 120, 20, ${opacity})`;
+    ctx.arc(sc.x, sc.y, Math.max(1, currentRadius), 0, Math.PI * 2);
     ctx.fill();
+
+    // Draw outer ring for extra effect
+    ctx.beginPath();
+    ctx.strokeStyle = `rgba(255, 180, 50, ${opacity * 0.7})`;
+    ctx.lineWidth = 3;
+    ctx.arc(sc.x, sc.y, Math.max(1, currentRadius), 0, Math.PI * 2);
+    ctx.stroke();
   }
 
   // death spots (visual subtle)
@@ -764,124 +833,100 @@ canvas.addEventListener('click', (ev)=>{
 
 // ------------ Path editor UI ------------
 let selectedTower = null;
+let lastValidParams = { a: 1, b: 0 };
 const pathParamsDiv = document.getElementById('path-params');
-const pathTypeSelect = document.getElementById('path-type');
 
 function createParamInput(id, label, defaultVal='') {
   const wrapper = document.createElement('div');
-  wrapper.innerHTML = `<label>${label}</label><input id="${id}" type="text" value="${defaultVal}">`;
+  wrapper.innerHTML = `<label>${label}</label><input id="${id}" type="number" step="any" value="${defaultVal}">`;
   return wrapper;
 }
 
 function refreshPathEditorFromSelected() {
   pathParamsDiv.innerHTML = '';
-  if (!selectedTower) { pathParamsDiv.innerHTML = '<div class="muted">No fire-control tower selected.</div>'; return; }
-  const pt = selectedTower.meta.path || { type: 'linear', params: {} };
-  pathTypeSelect.value = pt.type || 'linear';
-  buildParamInputs(pathTypeSelect.value, pt.params);
-}
-function buildParamInputs(type, existingParams={}) {
-  pathParamsDiv.innerHTML = '';
-  if (type === 'linear') {
-    pathParamsDiv.appendChild(createParamInput('p_a','a (x coeff for t)', existingParams.a||'1'));
-    pathParamsDiv.appendChild(createParamInput('p_b','b (x intercept)', existingParams.b||'0'));
-    pathParamsDiv.appendChild(createParamInput('p_c','c (y coeff for t)', existingParams.c||'0'));
-    pathParamsDiv.appendChild(createParamInput('p_d','d (y intercept)', existingParams.d||'0'));
-  } else if (type === 'hyperbola') {
-    pathParamsDiv.appendChild(createParamInput('p_a','a (x scale)', existingParams.a||'1'));
-    pathParamsDiv.appendChild(createParamInput('p_b','b (y scale)', existingParams.b||'1'));
-    pathParamsDiv.appendChild(createParamInput('p_h','h (x shift)', existingParams.h||'0'));
-    pathParamsDiv.appendChild(createParamInput('p_k','k (y shift)', existingParams.k||'0'));
-  } else if (type === 'ellipse') {
-    pathParamsDiv.appendChild(createParamInput('p_a','a (radius x)', existingParams.a||'6'));
-    pathParamsDiv.appendChild(createParamInput('p_b','b (radius y)', existingParams.b||'3'));
-    pathParamsDiv.appendChild(createParamInput('p_h','h (center x)', existingParams.h||'0'));
-    pathParamsDiv.appendChild(createParamInput('p_k','k (center y)', existingParams.k||'10'));
-  } else if (type === 'sinusoid') {
-    pathParamsDiv.appendChild(createParamInput('p_A','A (amplitude)', existingParams.A||'2'));
-    pathParamsDiv.appendChild(createParamInput('p_k','k (frequency)', existingParams.k||'1'));
-    pathParamsDiv.appendChild(createParamInput('p_phi','phi (phase)', existingParams.phi||'0'));
-    pathParamsDiv.appendChild(createParamInput('p_c','c (vertical shift)', existingParams.c||'0'));
+  if (!selectedTower) {
+    pathParamsDiv.innerHTML = '<div class="muted">No fire-control tower selected.</div>';
+    return;
   }
+  const pt = selectedTower.meta.path || { type: 'simple', params: { a: 1, b: 0 } };
+  buildParamInputs(pt.params);
 }
-pathTypeSelect.addEventListener('change', ()=> buildParamInputs(pathTypeSelect.value, {}));
-document.getElementById('btn-validate').addEventListener('click', ()=>{
-  const p = gatherParamsFromUI();
-  if (!p) return;
-  const result = validatePath(p.func, 60);
-  document.getElementById('launch-status').textContent = result.ok ? 'OK' : 'ERROR';
-  log('Validation: ' + (result.ok ? 'OK' : result.error));
-});
-document.getElementById('btn-confirm').addEventListener('click', ()=>{
-  if (!selectedTower) { log('No fire-control selected'); return; }
-  const p = gatherParamsFromUI();
-  if (!p) return;
-  const val = validatePath(p.func, 90);
-  if (!val.ok) { log('Parameters invalid: ' + val.error); return; }
-  selectedTower.meta.path = { type: p.type, params: p.params, func: p.func };
-  log('Path confirmed for tower at ' + selectedTower.x + ',' + selectedTower.y);
-});
-document.getElementById('btn-launch').addEventListener('click', ()=>{
-  if (!selectedTower || !selectedTower.meta.path) { log('Select a tower with confirmed path'); return; }
-  // spawn a plane using the tower's path function but offset it's param domain by tower position optionally
-  const pf = selectedTower.meta.path.func;
-  // create wrapper path that offsets by tower position (if desired)
-  const wrapper = {
-    positionAt: (t) => {
-      const p = pf.positionAt(t);
-      return { x: p.x + selectedTower.x, y: p.y + selectedTower.y };
-    },
-    tmin: pf.tmin, tmax: pf.tmax
+
+function buildParamInputs(existingParams={}) {
+  pathParamsDiv.innerHTML = '';
+  pathParamsDiv.appendChild(createParamInput('p_a', 'a (slope)', existingParams.a || '1'));
+  pathParamsDiv.appendChild(createParamInput('p_b', 'b (y-intercept)', existingParams.b || '0'));
+
+  // Add live update listeners
+  const inputA = document.getElementById('p_a');
+  const inputB = document.getElementById('p_b');
+
+  const updatePath = () => {
+    if (!selectedTower) return;
+
+    const a = parseFloat(inputA.value);
+    const b = parseFloat(inputB.value);
+
+    // Validate inputs
+    if (!isFinite(a) || !isFinite(b) || isNaN(a) || isNaN(b)) {
+      // Revert to last valid values
+      inputA.value = lastValidParams.a;
+      inputB.value = lastValidParams.b;
+      return;
+    }
+
+    // Create and validate the path
+    const func = makePathSimple(a, b, -10, 10);
+    const result = validatePath(func, 60);
+
+    if (result.ok) {
+      // Update the tower's path
+      selectedTower.meta.path = {
+        type: 'simple',
+        params: { a, b },
+        func: func
+      };
+      lastValidParams = { a, b };
+    } else {
+      // Revert to last valid values
+      inputA.value = lastValidParams.a;
+      inputB.value = lastValidParams.b;
+    }
   };
-  const pl = spawnPlane(wrapper, 0, 12, selectedTower.id);
-  log('Launched plane from tower ' + selectedTower.id);
-});
+
+  inputA.addEventListener('input', updatePath);
+  inputB.addEventListener('input', updatePath);
+
+  // Store initial valid params
+  lastValidParams = { a: existingParams.a || 1, b: existingParams.b || 0 };
+}
 
 // gather UI params and return {type, params, func}
 function gatherParamsFromUI() {
-  const type = pathTypeSelect.value;
   try {
-    if (type === 'linear') {
-      const a = parseFloat(document.getElementById('p_a').value);
-      const b = parseFloat(document.getElementById('p_b').value);
-      const c = parseFloat(document.getElementById('p_c').value);
-      const d = parseFloat(document.getElementById('p_d').value);
-      const func = makePathLinear(a,b,c,d, -10, 10);
-      return { type, params:{a,b,c,d}, func };
-    } else if (type === 'hyperbola') {
-      const a = parseFloat(document.getElementById('p_a').value);
-      const b = parseFloat(document.getElementById('p_b').value);
-      const h = parseFloat(document.getElementById('p_h').value);
-      const k = parseFloat(document.getElementById('p_k').value);
-      const func = makePathHyperbola(a,b,h,k, 0.2, 6);
-      return { type, params:{a,b,h,k}, func };
-    } else if (type === 'ellipse') {
-      const a = Math.abs(parseFloat(document.getElementById('p_a').value));
-      const b = Math.abs(parseFloat(document.getElementById('p_b').value));
-      const h = parseFloat(document.getElementById('p_h').value);
-      const k = parseFloat(document.getElementById('p_k').value);
-      const func = { positionAt: (t) => ({ x: h + a*Math.cos(t), y: k + b*Math.sin(t) }), tmin:0, tmax:2*Math.PI };
-      return { type, params:{a,b,h,k}, func };
-    } else if (type === 'sinusoid') {
-      const A = parseFloat(document.getElementById('p_A').value);
-      const k = parseFloat(document.getElementById('p_k').value);
-      const phi = parseFloat(document.getElementById('p_phi').value);
-      const c = parseFloat(document.getElementById('p_c').value);
-      const func = makePathSinusoid(A,k,phi,c, -10, 10);
-      return { type, params:{A,k,phi,c}, func };
+    const aInput = document.getElementById('p_a');
+    const bInput = document.getElementById('p_b');
+    if (!aInput || !bInput) return null;
+
+    const a = parseFloat(aInput.value);
+    const b = parseFloat(bInput.value);
+
+    if (!isFinite(a) || !isFinite(b) || isNaN(a) || isNaN(b)) {
+      return null;
     }
+
+    const func = makePathSimple(a, b, -10, 10);
+    return { type: 'simple', params: { a, b }, func };
   } catch(e) {
     log('Error parsing params: ' + e);
     return null;
   }
-  log('Unknown path type: ' + type);
-  return null;
 }
 
 // When bombs spawn, immediately apply damage (also keep them for visual)
 const oldSpawnBomb = spawnBomb;
 spawnBomb = function(x,y,damage=CONFIG.bombDamage, radius=CONFIG.bombRadius) {
-  const b = { id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6 };
+  const b = { id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6, maxLife: 0.6 };
   World.bombs.push(b);
   resolveBombDamage(b);
   return b;
@@ -890,13 +935,26 @@ spawnBomb = function(x,y,damage=CONFIG.bombDamage, radius=CONFIG.bombRadius) {
 // init sample resources
 for (let i=0;i<8;i++) spawnResource((Math.random()-0.5)*(CONFIG.worldWidth-6), (Math.random()-0.5)*(CONFIG.worldHeight-6), 3+Math.random()*3);
 
+// Place default fire tower adjacent to base with y=ax+b equation
+const defaultTower = createStructure('fire-control', 2.5, 0.5, {
+  w:1, h:1,
+  meta:{
+    path: {
+      type: 'simple',
+      params: { a: 1, b: 0 },
+      func: makePathSimple(1, 0, -10, 10)
+    }
+  }
+});
+log('Default fire tower placed at (2.5, 0.5) with equation y=x');
+
 // initial canvas size
 resizeCanvas();
 requestAnimationFrame(loop);
 
 // show initial help sample path UI
-buildParamInputs('linear', { a:1,b:-10,c:0,d:12 });
-log('Game initialized. Place a fire-control tower, select it, edit path, confirm, then launch.');
+buildParamInputs('simple', { a:1, b:0 });
+log('Game initialized. Select the fire tower to edit its equation.');
 
 </script>
 </body>
