@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Math Defense — Starter</title>
+<style>
+  :root { --sidebar: 320px; --grid-size: 20px; background:#111; color:#eee; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+  body { margin:0; display:flex; height:100vh; background:#0b0b0f; color:var(--text,#eee); }
+  #sidebar { width:var(--sidebar); padding:12px; box-sizing:border-box; background:#0f1116; border-right:1px solid #222; overflow:auto; }
+  #game { flex:1; position:relative; }
+  canvas { display:block; width:100%; height:100%; }
+  h1 { margin:4px 0 8px; font-size:18px; }
+  label { display:block; margin-top:8px; font-size:12px; color:#cdd; }
+  input[type="number"], input[type="text"], select { width:100%; box-sizing:border-box; padding:6px; margin-top:4px; background:#16171b; border:1px solid #2a2a33; color:#eee; }
+  .button { display:inline-block; margin-top:8px; padding:8px 10px; background:#1e8cff; color:white; border-radius:6px; cursor:pointer; user-select:none; }
+  .tool { padding:8px; background:#121218; border:1px solid #24242a; margin:6px 0; cursor:pointer; }
+  .small { font-size:12px; padding:6px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .muted { color:#9aa0a6; font-size:12px; }
+  pre { background:#09090b; padding:8px; overflow:auto; font-size:12px; color:#cfc; }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <h1>Math Defense — Editor</h1>
+    <div class="muted">Base: 2×2 box centered at origin (0,0). Grid cell = 1 unit.</div>
+
+    <div style="margin-top:12px;">
+      <div class="tool" id="tool-place-tower">Place: Fire Control Tower (1×1)</div>
+      <div class="tool" id="tool-place-depot">Place: Depot / Silo (2×2)</div>
+      <div class="tool" id="tool-place-mortar">Place: Mortar Pit (1×1)</div>
+      <div class="tool" id="tool-place-harvester">Spawn Harvester</div>
+      <div class="tool" id="tool-remove">Remove Structure</div>
+    </div>
+
+    <hr/>
+    <h2 style="font-size:14px;margin-top:8px;">Selected Fire Control Tower</h2>
+    <div class="muted">Select a placed fire-control tower (click it) to edit its plane path.</div>
+
+    <label>Path Type</label>
+    <select id="path-type">
+      <option value="linear">Linear (x = a t + b, y = c t + d)</option>
+      <option value="hyperbola">Hyperbolic (rectangular-style param)</option>
+      <option value="ellipse">Ellipse (parametric)</option>
+      <option value="sinusoid">Sinusoidal (y = A sin(k t + φ) + c)</option>
+    </select>
+
+    <div id="path-params" style="margin-top:8px;">
+      <!-- Dynamic parameter inputs will be injected here -->
+    </div>
+
+    <div style="margin-top:8px;" class="row">
+      <div class="button" id="btn-validate">Validate Parameters</div>
+      <div class="button" id="btn-confirm">Confirm Path</div>
+    </div>
+
+    <div style="margin-top:8px;" class="row">
+      <div class="button" id="btn-launch">Launch Strike</div>
+      <div class="muted" id="launch-status"></div>
+    </div>
+
+    <hr/>
+    <div>
+      <h3 style="font-size:13px;margin:6px 0;">Game Info</h3>
+      <div class="muted">Resources: <span id="resource-count">0</span></div>
+      <div class="muted">Base Health: <span id="base-health">100</span></div>
+      <div class="muted">Bugs alive: <span id="bug-count">0</span></div>
+    </div>
+
+    <hr/>
+    <h3 style="font-size:13px;margin:6px 0;">Developer Notes</h3>
+    <div class="muted">Equation validation samples the parametric function over t-range to ensure numeric finite points, no NaN/Inf, and path intersects the map bounds.</div>
+    <pre id="log" style="height:200px">Logs...</pre>
+  </div>
+
+  <div id="game">
+    <canvas id="canvas"></canvas>
+  </div>
+
+<script>
+/*
+Math Defense - Starter JS
+Single-file game engine prototype. Intentionally modular to be extended.
+Coordinate conventions:
+ - World uses Cartesian coordinates with origin (0,0) centered at canvas center.
+ - 1 world unit == grid cell. Grid cell size on screen = gridSizePx.
+ - Entities hold x,y in world units.
+*/
+
+// ---------- Configuration ----------
+const CONFIG = {
+  gridSizePx: 24,             // pixels per 1 world unit
+  worldWidth: 60,             // grid units horizontally (for bounds)
+  worldHeight: 40,            // grid units vertically
+  tickMs: 1000 / 60,
+  baseSize: 2,                // base is 2x2 units centered at origin
+  baseHealth: 100,
+  bugSpawnInterval: 1600,     // ms
+  maxSamplePoints: 200,
+  originAttractionWeight: 2.5, // must be > sum repulsions to ensure attraction dominates
+  repulsionDecay: 8.0,         // higher -> more localized death spot repulsion
+  harvesterSpeed: 4.0,         // units/sec
+  bugSpeedMin: 0.6,
+  bugSpeedMax: 1.6,
+  planeSpeed: 20.0,            // param t units per second for path parameterization
+  bombRadius: 1.2,
+  mortarRadius: 2.2,
+  mortarDamage: 25,
+  bombDamage: 40
+};
+
+// ---------- Canvas and coordinate transforms ----------
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+let DPR = window.devicePixelRatio || 1;
+function resizeCanvas() {
+  canvas.width = Math.floor(canvas.clientWidth * DPR);
+  canvas.height = Math.floor(canvas.clientHeight * DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', resizeCanvas);
+
+// Convert world <-> screen
+function worldToScreen(x, y) {
+  const centerX = canvas.clientWidth / 2;
+  const centerY = canvas.clientHeight / 2;
+  return {
+    x: centerX + x * CONFIG.gridSizePx,
+    y: centerY - y * CONFIG.gridSizePx
+  };
+}
+function screenToWorld(px, py) {
+  const centerX = canvas.clientWidth / 2;
+  const centerY = canvas.clientHeight / 2;
+  return {
+    x: (px - centerX) / CONFIG.gridSizePx,
+    y: (centerY - py) / CONFIG.gridSizePx
+  };
+}
+
+// ---------- Utility ----------
+function log(msg) {
+  const pre = document.getElementById('log');
+  const ts = new Date().toLocaleTimeString();
+  pre.textContent = `${ts} - ${msg}\n` + pre.textContent;
+}
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function vecLen(x,y) { return Math.hypot(x,y); }
+function normalize(x,y) { const L = vecLen(x,y) || 1; return {x: x/L, y: y/L}; }
+
+// ---------- World state ----------
+const World = {
+  structures: [],    // placed towers, depots, mortar pits
+  bugs: [],
+  deathSpots: [],    // locations where bugs died {x,y,amount}
+  resources: [],     // resource nodes {x,y,amount}
+  harvesters: [],    // harvesters with state
+  planes: [],        // active planes (airstrike)
+  bombs: [],         // active bombs (from planes)
+  ticks: 0,
+  resourceCount: 0,
+  baseHealth: CONFIG.baseHealth
+};
+
+// ---------- Grid and placement helpers ----------
+function snapToGrid(x,y) {
+  // place grid aligned with integer coordinates
+  return { x: Math.round(x), y: Math.round(y) };
+}
+function canPlaceAt(x,y,w=1,h=1) {
+  // Simple occupancy check: ensure not overlapping base (except allowed), not out of bounds, not inside existing structure
+  const left = x - w/2, right = x + w/2, bottom = y - h/2, top = y + h/2;
+  // bounds check relative to world dimensions
+  if (left < -CONFIG.worldWidth/2 || right > CONFIG.worldWidth/2 || bottom < -CONFIG.worldHeight/2 || top > CONFIG.worldHeight/2) return false;
+  // avoid overlapping base (base center at origin, size baseSize)
+  const baseHalf = CONFIG.baseSize/2;
+  if (!(right < -baseHalf || left > baseHalf || top < -baseHalf || bottom > baseHalf)) {
+    // overlapping base — allow structures only if not inside the base? We'll disallow for now.
+    return false;
+  }
+  // avoid overlapping with other structures
+  for (let s of World.structures) {
+    const sw = s.w, sh = s.h;
+    const sleft = s.x - sw/2, sright = s.x + sw/2, sbottom = s.y - sh/2, stop = s.y + sh/2;
+    if (!(right < sleft || left > sright || top < sbottom || bottom > stop)) return false;
+  }
+  return true;
+}
+
+// ---------- Entities constructors ----------
+function createStructure(type, x, y, opts={}) {
+  const s = { id: 's' + (Math.random()*1e6|0), type, x,y, w: opts.w||1, h: opts.h||1, meta: opts.meta||{} };
+  World.structures.push(s);
+  return s;
+}
+function spawnBug(x,y) {
+  const speed = Math.random()*(CONFIG.bugSpeedMax - CONFIG.bugSpeedMin) + CONFIG.bugSpeedMin;
+  const b = { id: 'b' + (Math.random()*1e6|0), x,y, hp: 10, speed, alive: true, rotation:0 };
+  World.bugs.push(b);
+  return b;
+}
+function spawnResource(x,y,amount=5) {
+  World.resources.push({ id: 'r' + (Math.random()*1e6|0), x,y, amount});
+}
+function spawnHarvester(x,y) {
+  const h = { id:'h' + (Math.random()*1e6|0), x,y, state:'idle', carry:0, targetResource:null, speed: CONFIG.harvesterSpeed };
+  World.harvesters.push(h);
+  return h;
+}
+function spawnPlane(pathFunc, t0=0, lifetime=10, towerRef=null) {
+  const p = { id:'p'+(Math.random()*1e6|0), pathFunc, t: t0, lifetime, towerRef, alive:true };
+  World.planes.push(p);
+  return p;
+}
+function spawnBomb(x,y,damage=CONFIG.bombDamage, radius=CONFIG.bombRadius) {
+  World.bombs.push({ id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6 }); // short explosion life
+}
+
+// ---------- Path templates and parameter handling ----------
+/*
+We support parametric functions parameterized by t in [tmin,tmax], or effectively unbounded but sampled.
+Each path function is returned as an object:
+  { positionAt(t) => {x,y}, tmin, tmax }
+Validation: sample N points between tmin..tmax and ensure numeric/finite and not NaN.
+*/
+
+function makePathLinear(a,b,c,d,tmin=-5,tmax=5) {
+  return {
+    positionAt: (t) => ({ x: a*t + b, y: c*t + d }),
+    tmin, tmax
+  };
+}
+
+// Hyperbola: We'll implement a rectangular hyperbola parametric: x = a / t + h, y = b / t + k
+// to avoid singular point sample checks must avoid t=0; we provide domain avoiding zero.
+function makePathHyperbola(a,b,h,k,tmin=0.1,tmax=5) {
+  return {
+    positionAt: (t) => ({ x: a / t + h, y: b / t + k }),
+    tmin, tmax
+  };
+}
+
+// Ellipse parametric: x = h + a cos(t), y = k + b sin(t)
+function makePathEllipse(a,b,h,k,tmin=0,tmax:undefined) {
+  return {
+    positionAt: (t) => ({ x: h + a*Math.cos(t), y: k + b*Math.sin(t) }),
+    tmin: 0, tmax: 2*Math.PI
+  };
+}
+
+// Sinusoidal path — treat param as x = t, y = A sin(k t + phi) + c, but to keep param speed we let t map to x
+function makePathSinusoid(A,k,phi,c,tmin=-10,tmax=10) {
+  return {
+    positionAt: (t) => ({ x: t, y: A*Math.sin(k*t + phi) + c }),
+    tmin, tmax
+  };
+}
+
+// Validation routine: sample points and check finite/within bounds
+function validatePath(pathObj, sampleCount=60) {
+  const tmin = (pathObj.tmin !== undefined) ? pathObj.tmin : -10;
+  const tmax = (pathObj.tmax !== undefined) ? pathObj.tmax : tmin + 10;
+  for (let i=0;i<sampleCount;i++) {
+    const tt = tmin + (tmax - tmin) * (i / Math.max(1,sampleCount-1));
+    let p;
+    try { p = pathObj.positionAt(tt); }
+    catch(e) { return { ok:false, error: 'Exception during sampling: ' + e.toString() }; }
+    if (!p || !isFinite(p.x) || !isFinite(p.y) || isNaN(p.x) || isNaN(p.y)) {
+      return { ok:false, error: `Invalid point at t=${tt}: (${p && p.x}, ${p && p.y})` };
+    }
+    // optional: ensure not wildly out of map bounds
+    if (Math.abs(p.x) > CONFIG.worldWidth || Math.abs(p.y) > CONFIG.worldHeight) {
+      return { ok:false, error: `Sample at t=${tt} outside world bounds: (${p.x.toFixed(1)},${p.y.toFixed(1)})` };
+    }
+  }
+  return { ok:true };
+}
+
+// ---------- Bug AI: attraction to origin, repulsion from deathSpots ----------
+function updateBug(b, dt) {
+  // compute vector towards origin
+  const toOrigin = { x: -b.x, y: -b.y };
+  let forceX = CONFIG.originAttractionWeight * toOrigin.x;
+  let forceY = CONFIG.originAttractionWeight * toOrigin.y;
+
+  // add repulsion from death spots
+  for (let d of World.deathSpots) {
+    const dx = b.x - d.x, dy = b.y - d.y;
+    const dist2 = dx*dx + dy*dy + 1e-6;
+    const repulsion = (d.amount || 1) / (dist2 * CONFIG.repulsionDecay);
+    forceX += repulsion * dx;
+    forceY += repulsion * dy;
+  }
+  // normalize direction
+  const dir = normalize(forceX, forceY);
+  b.x += dir.x * b.speed * dt;
+  b.y += dir.y * b.speed * dt;
+  b.rotation = Math.atan2(dir.y, dir.x);
+  // Check arrival at base (base is 2x2 centered at origin)
+  const half = CONFIG.baseSize / 2;
+  if (b.x > -half && b.x < half && b.y > -half && b.y < half) {
+    b.alive = false;
+    World.baseHealth = Math.max(0, World.baseHealth - 6);
+    log('Bug hit base! Base health: ' + World.baseHealth);
+    World.deathSpots.push({ x: b.x, y: b.y, amount: 0.5 });
+  }
+}
+
+// ---------- Harvester AI ----------
+function updateHarvester(h, dt) {
+  // Very simple: if not carrying and resources exist, go to nearest resource; otherwise return to base
+  if (h.state === 'idle') {
+    // find nearest resource with amount>0
+    let best = null, bestDist = 1e9;
+    for (let r of World.resources) {
+      if (r.amount <= 0) continue;
+      const d = vecLen(r.x - h.x, r.y - h.y);
+      if (d < bestDist) { bestDist = d; best = r; }
+    }
+    if (best) { h.targetResource = best; h.state = 'toResource'; }
+    else { h.state = 'idle'; }
+  }
+  if (h.state === 'toResource' && h.targetResource) {
+    const r = h.targetResource;
+    const dx = r.x - h.x, dy = r.y - h.y;
+    const dist = vecLen(dx,dy);
+    if (dist < 0.4) {
+      // pick up
+      const take = Math.min(1, r.amount);
+      r.amount -= take; h.carry += take; h.state = 'toBase'; log('Harvester picked up ' + take);
+    } else {
+      const dir = normalize(dx,dy);
+      h.x += dir.x * h.speed * dt;
+      h.y += dir.y * h.speed * dt;
+    }
+  } else if (h.state === 'toBase') {
+    const dx = 0 - h.x, dy = 0 - h.y;
+    const dist = vecLen(dx,dy);
+    if (dist < 0.6) {
+      // deposit
+      World.resourceCount += h.carry;
+      document.getElementById('resource-count').textContent = World.resourceCount;
+      log('Harvester deposited ' + h.carry + ' (total ' + World.resourceCount + ')');
+      h.carry = 0; h.state = 'idle'; h.targetResource = null;
+    } else {
+      const dir = normalize(dx,dy);
+      h.x += dir.x * h.speed * dt;
+      h.y += dir.y * h.speed * dt;
+    }
+  }
+}
+
+// ---------- Plane behavior (airstrike) ----------
+function updatePlane(p, dt) {
+  p.t += dt * CONFIG.planeSpeed;
+  // get position from param
+  const pos = p.pathFunc.positionAt(p.t);
+  // drop bombs at intervals or based on some condition
+  if (!p._nextDrop) p._nextDrop = 0;
+  p._nextDrop -= dt;
+  if (p._nextDrop <= 0) {
+    spawnBomb(pos.x, pos.y);
+    p._nextDrop = 0.8; // seconds between bomb drops
+  }
+  p.lifetime -= dt;
+  if (p.lifetime <= 0) p.alive = false;
+}
+
+// ---------- Bombs lifecycle and damage ----------
+function updateBomb(bomb, dt) {
+  bomb.life -= dt;
+  if (bomb.life <= 0) {
+    // explosion resolves on creation — we still need to apply damage when created
+  }
+}
+
+// When a bomb is created, immediately damage bugs in radius (instant damage)
+function resolveBombDamage(bomb) {
+  const victims = [];
+  for (let bug of World.bugs) {
+    if (!bug.alive) continue;
+    const d = vecLen(bug.x - bomb.x, bug.y - bomb.y);
+    if (d <= bomb.radius) {
+      bug.hp -= bomb.damage;
+      if (bug.hp <= 0) { bug.alive = false; World.deathSpots.push({ x: bug.x, y: bug.y, amount: 1.0 }); victims.push(bug.id); }
+    }
+  }
+  if (victims.length) log('Bomb killed ' + victims.length + ' bugs');
+}
+
+// ---------- Mortar firing ----------
+function fireMortarAt(x,y) {
+  // immediate effect: damage all bugs within radius
+  let count=0;
+  for (let bug of World.bugs) {
+    if (!bug.alive) continue;
+    const d = vecLen(bug.x - x, bug.y - y);
+    if (d <= CONFIG.mortarRadius) {
+      bug.hp -= CONFIG.mortarDamage;
+      if (bug.hp <= 0) { bug.alive=false; World.deathSpots.push({ x: bug.x, y: bug.y, amount: 1.0 }); count++; }
+    }
+  }
+  log('Mortar hit: ' + count + ' killed');
+}
+
+// ---------- Game loop ----------
+let lastTime = performance.now();
+let accumulator = 0;
+
+function gameTick(dt) {
+  World.ticks++;
+  // Spawn bugs periodically
+  if (!gameTick._spawnTimer) gameTick._spawnTimer = 0;
+  gameTick._spawnTimer += dt*1000;
+  if (gameTick._spawnTimer >= CONFIG.bugSpawnInterval) {
+    gameTick._spawnTimer = 0;
+    // spawn a small swarm from a random border location
+    const side = Math.random();
+    let x,y;
+    if (side < 0.25) { x = -CONFIG.worldWidth/2; y = (Math.random()-0.5)*CONFIG.worldHeight; }
+    else if (side < 0.5) { x = CONFIG.worldWidth/2; y = (Math.random()-0.5)*CONFIG.worldHeight; }
+    else if (side < 0.75) { y = -CONFIG.worldHeight/2; x = (Math.random()-0.5)*CONFIG.worldWidth; }
+    else { y = CONFIG.worldHeight/2; x = (Math.random()-0.5)*CONFIG.worldWidth; }
+    // spawn 3-6 bugs
+    const n = 3 + Math.floor(Math.random()*4);
+    for (let i=0;i<n;i++) spawnBug(x + Math.random()*1.6-0.8, y + Math.random()*1.6-0.8);
+  }
+
+  // Update bugs
+  for (let b of World.bugs) {
+    if (!b.alive) continue;
+    updateBug(b, dt);
+  }
+  // Remove dead bugs and add death spots
+  for (let i=World.bugs.length-1;i>=0;i--) {
+    if (!World.bugs[i].alive) {
+      World.bugs.splice(i,1);
+    }
+  }
+  // decaying death spots a bit
+  for (let ds of World.deathSpots) ds.amount = Math.max(0, ds.amount - dt*0.02);
+  // update harvesters
+  for (let h of World.harvesters) updateHarvester(h, dt);
+  // planes
+  for (let p of World.planes) {
+    if (!p.alive) continue;
+    updatePlane(p, dt);
+    // resolve bomb if dropped
+    if (p._justDropped) { resolveBombDamage(p._justDropped); p._justDropped=null; }
+  }
+  // bombs: when created we immediately resolve damage, so we just decay for visuals; remove after life<=0
+  for (let i=World.bombs.length-1;i>=0;i--) {
+    const bb = World.bombs[i];
+    bb.life -= dt;
+    if (bb.life <= 0) World.bombs.splice(i,1);
+  }
+  // remove dead planes
+  for (let i=World.planes.length-1;i>=0;i--) if (!World.planes[i].alive) World.planes.splice(i,1);
+  // base health check
+  document.getElementById('base-health').textContent = Math.max(0, Math.round(World.baseHealth));
+  document.getElementById('bug-count').textContent = World.bugs.length;
+}
+
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+  accumulator += dt;
+  while (accumulator >= CONFIG.tickMs/1000) {
+    gameTick(CONFIG.tickMs/1000);
+    accumulator -= CONFIG.tickMs/1000;
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ---------- Rendering ----------
+function renderGrid() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  // background
+  ctx.fillStyle = '#061017';
+  ctx.fillRect(0,0,w,h);
+  // draw grid
+  ctx.strokeStyle = '#0b1a23';
+  ctx.lineWidth = 1;
+  const centerX = w/2, centerY = h/2;
+  // vertical lines
+  const step = CONFIG.gridSizePx;
+  for (let gx = Math.floor(-centerX/step)-1; gx < Math.floor((w-centerX)/step)+1; gx++) {
+    ctx.beginPath();
+    const sx = centerX + gx*step;
+    ctx.moveTo(sx, 0);
+    ctx.lineTo(sx, h);
+    ctx.stroke();
+  }
+  for (let gy = Math.floor(-centerY/step)-1; gy < Math.floor((h-centerY)/step)+1; gy++) {
+    ctx.beginPath();
+    const sy = centerY + gy*step;
+    ctx.moveTo(0, sy);
+    ctx.lineTo(w, sy);
+    ctx.stroke();
+  }
+  // axes
+  ctx.strokeStyle = '#1f6f9a';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(centerX, 0);
+  ctx.lineTo(centerX, h);
+  ctx.moveTo(0, centerY);
+  ctx.lineTo(w, centerY);
+  ctx.stroke();
+}
+
+function renderEntities() {
+  // base (2x2 box centered at origin)
+  const half = CONFIG.baseSize / 2;
+  const topLeft = worldToScreen(-half, half);
+  const bottomRight = worldToScreen(half, -half);
+  const baseW = bottomRight.x - topLeft.x;
+  const baseH = bottomRight.y - topLeft.y;
+  ctx.fillStyle = '#6c9a3d';
+  ctx.fillRect(topLeft.x, topLeft.y, baseW, baseH);
+  ctx.strokeStyle = '#2d5b2a';
+  ctx.strokeRect(topLeft.x, topLeft.y, baseW, baseH);
+
+  // structures
+  for (let s of World.structures) {
+    const tl = worldToScreen(s.x - s.w/2, s.y + s.h/2);
+    const br = worldToScreen(s.x + s.w/2, s.y - s.h/2);
+    const w = br.x - tl.x, h = br.y - tl.y;
+    if (s.type === 'fire-control') {
+      ctx.fillStyle = '#2b70d6';
+      ctx.fillRect(tl.x, tl.y, w, h);
+      ctx.strokeStyle = '#153a66';
+      ctx.strokeRect(tl.x, tl.y, w, h);
+      ctx.fillStyle = '#fff'; ctx.font = '12px sans-serif'; ctx.fillText('F', tl.x + 4, tl.y + 14);
+    } else if (s.type === 'depot') {
+      ctx.fillStyle = '#a76f3a';
+      ctx.fillRect(tl.x, tl.y, w, h);
+      ctx.strokeStyle = '#6d431f'; ctx.strokeRect(tl.x, tl.y, w, h);
+    } else if (s.type === 'mortar') {
+      ctx.fillStyle = '#8b2a2a';
+      ctx.fillRect(tl.x, tl.y, w, h);
+      ctx.strokeStyle = '#4d1515'; ctx.strokeRect(tl.x, tl.y, w, h);
+      ctx.fillStyle = '#fff'; ctx.fillText('M', tl.x + 4, tl.y + 14);
+    }
+  }
+
+  // resources
+  for (let r of World.resources) {
+    const sc = worldToScreen(r.x, r.y);
+    ctx.beginPath();
+    ctx.fillStyle = '#e9d04a';
+    ctx.arc(sc.x, sc.y, Math.max(3, 3 + r.amount), 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // harvesters
+  for (let h of World.harvesters) {
+    const sc = worldToScreen(h.x, h.y);
+    ctx.fillStyle = '#c2c2ff';
+    ctx.fillRect(sc.x-6, sc.y-6, 12,12);
+  }
+
+  // bugs (triangles)
+  for (let b of World.bugs) {
+    const sc = worldToScreen(b.x, b.y);
+    ctx.save();
+    ctx.translate(sc.x, sc.y);
+    ctx.rotate(-b.rotation); // screen y is inverted
+    ctx.fillStyle = '#f04e3e';
+    ctx.beginPath();
+    ctx.moveTo(0, -8);
+    ctx.lineTo(6, 6);
+    ctx.lineTo(-6, 6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // planes
+  for (let p of World.planes) {
+    const pos = p.pathFunc.positionAt(p.t);
+    const sc = worldToScreen(pos.x, pos.y);
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(sc.x, sc.y, 5, 0, Math.PI*2);
+    ctx.fill();
+    // show projected path small dots for clarity
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    for (let s=0;s<12;s++) {
+      const tt = p.t + (s+1)*0.5;
+      try {
+        const pp = p.pathFunc.positionAt(tt);
+        const scc = worldToScreen(pp.x, pp.y);
+        ctx.fillRect(scc.x-2, scc.y-2, 3,3);
+      } catch(e){}
+    }
+  }
+
+  // bombs (visual)
+  for (let b of World.bombs) {
+    const sc = worldToScreen(b.x, b.y);
+    ctx.beginPath();
+    ctx.fillStyle = 'rgba(255,120,20,0.9)';
+    ctx.arc(sc.x, sc.y, Math.max(3, b.radius * CONFIG.gridSizePx*0.8), 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // death spots (visual subtle)
+  for (let d of World.deathSpots) {
+    const sc = worldToScreen(d.x, d.y);
+    ctx.fillStyle = 'rgba(200,0,30,0.08)';
+    ctx.beginPath();
+    ctx.arc(sc.x, sc.y, Math.max(4, (d.amount || 1) * 6), 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function render() {
+  renderGrid();
+  renderEntities();
+}
+
+// ---------- Input & UI handling ----------
+let currentTool = null;
+document.getElementById('tool-place-tower').addEventListener('click', ()=>{ currentTool = 'place-fire'; log('Tool: place fire-control'); });
+document.getElementById('tool-place-depot').addEventListener('click', ()=>{ currentTool = 'place-depot'; log('Tool: place depot'); });
+document.getElementById('tool-place-mortar').addEventListener('click', ()=>{ currentTool = 'place-mortar'; log('Tool: place mortar'); });
+document.getElementById('tool-place-harvester').addEventListener('click', ()=>{ // spawn harvester near base
+  spawnHarvester(2.5,0.5);
+  log('Harvester spawned'); });
+document.getElementById('tool-remove').addEventListener('click', ()=>{ currentTool = 'remove'; log('Tool: remove'); });
+
+canvas.addEventListener('click', (ev)=>{
+  const rect = canvas.getBoundingClientRect();
+  const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
+  const wpos = screenToWorld(sx, sy);
+  const snapped = snapToGrid(wpos.x, wpos.y);
+
+  if (currentTool === 'place-fire') {
+    if (canPlaceAt(snapped.x, snapped.y, 1, 1)) {
+      const tower = createStructure('fire-control', snapped.x, snapped.y, { w:1, h:1, meta:{ path: null }});
+      log('Placed fire control at ' + snapped.x + ',' + snapped.y);
+    } else log('Cannot place there');
+  } else if (currentTool === 'place-depot') {
+    if (canPlaceAt(snapped.x, snapped.y, 2, 2)) {
+      createStructure('depot', snapped.x, snapped.y, { w:2, h:2 });
+      log('Placed depot at ' + snapped.x + ',' + snapped.y);
+    } else log('Cannot place depot there');
+  } else if (currentTool === 'place-mortar') {
+    if (canPlaceAt(snapped.x, snapped.y, 1, 1)) {
+      createStructure('mortar', snapped.x, snapped.y, { w:1,h:1 });
+      log('Placed mortar at ' + snapped.x + ',' + snapped.y);
+    } else log('Cannot place mortar there');
+  } else if (currentTool === 'remove') {
+    // remove structure at position if any
+    let removed=false;
+    for (let i=World.structures.length-1;i>=0;i--) {
+      const s = World.structures[i];
+      if (Math.abs(s.x - snapped.x) <= s.w/2 && Math.abs(s.y - snapped.y) <= s.h/2) {
+        World.structures.splice(i,1);
+        log('Removed structure ' + s.type + ' at ' + s.x + ',' + s.y);
+        removed=true; break;
+      }
+    }
+    if (!removed) log('No structure to remove there');
+  } else {
+    // If no tool, maybe the user selected a tower to edit
+    // select structure
+    let clicked=null;
+    for (let s of World.structures) {
+      if (Math.abs(s.x - snapped.x) <= s.w/2 && Math.abs(s.y - snapped.y) <= s.h/2) { clicked = s; break; }
+    }
+    if (clicked && clicked.type === 'fire-control') {
+      selectedTower = clicked;
+      log('Selected fire-control tower at ' + clicked.x + ',' + clicked.y);
+      refreshPathEditorFromSelected();
+    } else if (clicked && clicked.type === 'mortar') {
+      // direct mortar fire: click to fire at location (confirm)
+      fireMortarAt(snapped.x, snapped.y);
+    }
+  }
+});
+
+// ------------ Path editor UI ------------
+let selectedTower = null;
+const pathParamsDiv = document.getElementById('path-params');
+const pathTypeSelect = document.getElementById('path-type');
+
+function createParamInput(id, label, defaultVal='') {
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = `<label>${label}</label><input id="${id}" type="text" value="${defaultVal}">`;
+  return wrapper;
+}
+
+function refreshPathEditorFromSelected() {
+  pathParamsDiv.innerHTML = '';
+  if (!selectedTower) { pathParamsDiv.innerHTML = '<div class="muted">No fire-control tower selected.</div>'; return; }
+  const pt = selectedTower.meta.path || { type: 'linear', params: {} };
+  pathTypeSelect.value = pt.type || 'linear';
+  buildParamInputs(pathTypeSelect.value, pt.params);
+}
+function buildParamInputs(type, existingParams={}) {
+  pathParamsDiv.innerHTML = '';
+  if (type === 'linear') {
+    pathParamsDiv.appendChild(createParamInput('p_a','a (x coeff for t)', existingParams.a||'1'));
+    pathParamsDiv.appendChild(createParamInput('p_b','b (x intercept)', existingParams.b||'0'));
+    pathParamsDiv.appendChild(createParamInput('p_c','c (y coeff for t)', existingParams.c||'0'));
+    pathParamsDiv.appendChild(createParamInput('p_d','d (y intercept)', existingParams.d||'0'));
+  } else if (type === 'hyperbola') {
+    pathParamsDiv.appendChild(createParamInput('p_a','a (x scale)', existingParams.a||'1'));
+    pathParamsDiv.appendChild(createParamInput('p_b','b (y scale)', existingParams.b||'1'));
+    pathParamsDiv.appendChild(createParamInput('p_h','h (x shift)', existingParams.h||'0'));
+    pathParamsDiv.appendChild(createParamInput('p_k','k (y shift)', existingParams.k||'0'));
+  } else if (type === 'ellipse') {
+    pathParamsDiv.appendChild(createParamInput('p_a','a (radius x)', existingParams.a||'6'));
+    pathParamsDiv.appendChild(createParamInput('p_b','b (radius y)', existingParams.b||'3'));
+    pathParamsDiv.appendChild(createParamInput('p_h','h (center x)', existingParams.h||'0'));
+    pathParamsDiv.appendChild(createParamInput('p_k','k (center y)', existingParams.k||'10'));
+  } else if (type === 'sinusoid') {
+    pathParamsDiv.appendChild(createParamInput('p_A','A (amplitude)', existingParams.A||'2'));
+    pathParamsDiv.appendChild(createParamInput('p_k','k (frequency)', existingParams.k||'1'));
+    pathParamsDiv.appendChild(createParamInput('p_phi','phi (phase)', existingParams.phi||'0'));
+    pathParamsDiv.appendChild(createParamInput('p_c','c (vertical shift)', existingParams.c||'0'));
+  }
+}
+pathTypeSelect.addEventListener('change', ()=> buildParamInputs(pathTypeSelect.value, {}));
+document.getElementById('btn-validate').addEventListener('click', ()=>{
+  const p = gatherParamsFromUI();
+  if (!p) return;
+  const result = validatePath(p.func, 60);
+  document.getElementById('launch-status').textContent = result.ok ? 'OK' : 'ERROR';
+  log('Validation: ' + (result.ok ? 'OK' : result.error));
+});
+document.getElementById('btn-confirm').addEventListener('click', ()=>{
+  if (!selectedTower) { log('No fire-control selected'); return; }
+  const p = gatherParamsFromUI();
+  if (!p) return;
+  const val = validatePath(p.func, 90);
+  if (!val.ok) { log('Parameters invalid: ' + val.error); return; }
+  selectedTower.meta.path = { type: p.type, params: p.params, func: p.func };
+  log('Path confirmed for tower at ' + selectedTower.x + ',' + selectedTower.y);
+});
+document.getElementById('btn-launch').addEventListener('click', ()=>{
+  if (!selectedTower || !selectedTower.meta.path) { log('Select a tower with confirmed path'); return; }
+  // spawn a plane using the tower's path function but offset it's param domain by tower position optionally
+  const pf = selectedTower.meta.path.func;
+  // create wrapper path that offsets by tower position (if desired)
+  const wrapper = {
+    positionAt: (t) => {
+      const p = pf.positionAt(t);
+      return { x: p.x + selectedTower.x, y: p.y + selectedTower.y };
+    },
+    tmin: pf.tmin, tmax: pf.tmax
+  };
+  const pl = spawnPlane(wrapper, 0, 12, selectedTower.id);
+  log('Launched plane from tower ' + selectedTower.id);
+});
+
+// gather UI params and return {type, params, func}
+function gatherParamsFromUI() {
+  const type = pathTypeSelect.value;
+  try {
+    if (type === 'linear') {
+      const a = parseFloat(document.getElementById('p_a').value);
+      const b = parseFloat(document.getElementById('p_b').value);
+      const c = parseFloat(document.getElementById('p_c').value);
+      const d = parseFloat(document.getElementById('p_d').value);
+      const func = makePathLinear(a,b,c,d, -10, 10);
+      return { type, params:{a,b,c,d}, func };
+    } else if (type === 'hyperbola') {
+      const a = parseFloat(document.getElementById('p_a').value);
+      const b = parseFloat(document.getElementById('p_b').value);
+      const h = parseFloat(document.getElementById('p_h').value);
+      const k = parseFloat(document.getElementById('p_k').value);
+      const func = makePathHyperbola(a,b,h,k, 0.2, 6);
+      return { type, params:{a,b,h,k}, func };
+    } else if (type === 'ellipse') {
+      const a = Math.abs(parseFloat(document.getElementById('p_a').value));
+      const b = Math.abs(parseFloat(document.getElementById('p_b').value));
+      const h = parseFloat(document.getElementById('p_h').value);
+      const k = parseFloat(document.getElementById('p_k').value);
+      const func = { positionAt: (t) => ({ x: h + a*Math.cos(t), y: k + b*Math.sin(t) }), tmin:0, tmax:2*Math.PI };
+      return { type, params:{a,b,h,k}, func };
+    } else if (type === 'sinusoid') {
+      const A = parseFloat(document.getElementById('p_A').value);
+      const k = parseFloat(document.getElementById('p_k').value);
+      const phi = parseFloat(document.getElementById('p_phi').value);
+      const c = parseFloat(document.getElementById('p_c').value);
+      const func = makePathSinusoid(A,k,phi,c, -10, 10);
+      return { type, params:{A,k,phi,c}, func };
+    }
+  } catch(e) {
+    log('Error parsing params: ' + e);
+    return null;
+  }
+  log('Unknown path type: ' + type);
+  return null;
+}
+
+// When bombs spawn, immediately apply damage (also keep them for visual)
+const oldSpawnBomb = spawnBomb;
+spawnBomb = function(x,y,damage=CONFIG.bombDamage, radius=CONFIG.bombRadius) {
+  const b = { id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6 };
+  World.bombs.push(b);
+  resolveBombDamage(b);
+  return b;
+}
+
+// init sample resources
+for (let i=0;i<8;i++) spawnResource((Math.random()-0.5)*(CONFIG.worldWidth-6), (Math.random()-0.5)*(CONFIG.worldHeight-6), 3+Math.random()*3);
+
+// initial canvas size
+resizeCanvas();
+requestAnimationFrame(loop);
+
+// show initial help sample path UI
+buildParamInputs('linear', { a:1,b:-10,c:0,d:12 });
+log('Game initialized. Place a fire-control tower, select it, edit path, confirm, then launch.');
+
+</script>
+</body>
+</html>
