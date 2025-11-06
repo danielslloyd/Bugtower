@@ -100,7 +100,7 @@ const CONFIG = {
   maxSamplePoints: 200,
   originAttractionWeight: 2.5, // must be > sum repulsions to ensure attraction dominates
   repulsionDecay: 8.0,         // higher -> more localized death spot repulsion
-  harvesterSpeed: 4.0,         // units/sec
+  harvesterSpeed: 0.8,         // units/sec (nerfed by 0.2x from 4.0)
   bugSpeedMin: 0.6,
   bugSpeedMax: 1.6,
   planeSpeed: 20.0,            // param t units per second for path parameterization
@@ -165,8 +165,15 @@ const World = {
 };
 
 // ---------- Grid and placement helpers ----------
-function snapToGrid(x,y) {
-  // place grid aligned with integer coordinates
+function snapToGrid(x,y,w=1,h=1) {
+  // place grid aligned - buildings fill grid boxes
+  // For 1x1 buildings: center at (floor + 0.5, floor + 0.5) to fill one box
+  // For 2x2 buildings: center at (floor + 1, floor + 1) to fill four boxes
+  if (w === 1 && h === 1) {
+    return { x: Math.floor(x) + 0.5, y: Math.floor(y) + 0.5 };
+  } else if (w === 2 && h === 2) {
+    return { x: Math.floor(x) + 1, y: Math.floor(y) + 1 };
+  }
   return { x: Math.round(x), y: Math.round(y) };
 }
 function canPlaceAt(x,y,w=1,h=1) {
@@ -204,8 +211,8 @@ function spawnBug(x,y) {
 function spawnResource(x,y,amount=5) {
   World.resources.push({ id: 'r' + (Math.random()*1e6|0), x,y, amount});
 }
-function spawnHarvester(x,y) {
-  const h = { id:'h' + (Math.random()*1e6|0), x,y, state:'idle', carry:0, targetResource:null, speed: CONFIG.harvesterSpeed };
+function spawnHarvester(x,y,homeSilo=null) {
+  const h = { id:'h' + (Math.random()*1e6|0), x,y, state:'idle', carry:0, targetResource:null, speed: CONFIG.harvesterSpeed, homeSilo };
   World.harvesters.push(h);
   return h;
 }
@@ -310,7 +317,7 @@ function updateBug(b, dt) {
 
 // ---------- Harvester AI ----------
 function updateHarvester(h, dt) {
-  // Very simple: if not carrying and resources exist, go to nearest resource; otherwise return to base
+  // Very simple: if not carrying and resources exist, go to nearest resource; otherwise return to home silo
   if (h.state === 'idle') {
     // find nearest resource with amount>0
     let best = null, bestDist = 1e9;
@@ -329,14 +336,17 @@ function updateHarvester(h, dt) {
     if (dist < 0.4) {
       // pick up
       const take = Math.min(1, r.amount);
-      r.amount -= take; h.carry += take; h.state = 'toBase'; log('Harvester picked up ' + take);
+      r.amount -= take; h.carry += take; h.state = 'toSilo'; log('Harvester picked up ' + take);
     } else {
       const dir = normalize(dx,dy);
       h.x += dir.x * h.speed * dt;
       h.y += dir.y * h.speed * dt;
     }
-  } else if (h.state === 'toBase') {
-    const dx = 0 - h.x, dy = 0 - h.y;
+  } else if (h.state === 'toSilo') {
+    // Return to home silo (or origin if no home silo)
+    const targetX = h.homeSilo ? h.homeSilo.x : 0;
+    const targetY = h.homeSilo ? h.homeSilo.y : 0;
+    const dx = targetX - h.x, dy = targetY - h.y;
     const dist = vecLen(dx,dy);
     if (dist < 0.6) {
       // deposit
@@ -479,11 +489,11 @@ function loop(now) {
 function renderGrid() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
   ctx.clearRect(0,0,w,h);
-  // background
-  ctx.fillStyle = '#061017';
+  // background - very light gray
+  ctx.fillStyle = '#f5f5f5';
   ctx.fillRect(0,0,w,h);
-  // draw grid
-  ctx.strokeStyle = '#0b1a23';
+  // draw grid - dark gray lines
+  ctx.strokeStyle = '#404040';
   ctx.lineWidth = 1;
   const centerX = w/2, centerY = h/2;
   // vertical lines
@@ -502,8 +512,8 @@ function renderGrid() {
     ctx.lineTo(w, sy);
     ctx.stroke();
   }
-  // axes
-  ctx.strokeStyle = '#1f6f9a';
+  // axes - dark gray
+  ctx.strokeStyle = '#404040';
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(centerX, 0);
@@ -621,7 +631,69 @@ function renderEntities() {
 
 function render() {
   renderGrid();
+  renderFireTraces();
   renderEntities();
+}
+
+function renderFireTraces() {
+  // Draw fire traces for all turrets and mortar pits
+  for (let s of World.structures) {
+    if (s.type === 'fire-control') {
+      const isSelected = (s === selectedTower);
+      let pathFunc = null;
+
+      // For selected tower, show live preview of current UI params
+      if (isSelected) {
+        const previewPath = gatherParamsFromUI();
+        if (previewPath && previewPath.func) {
+          pathFunc = previewPath.func;
+        } else if (s.meta.path && s.meta.path.func) {
+          pathFunc = s.meta.path.func;
+        }
+      } else if (s.meta.path && s.meta.path.func) {
+        pathFunc = s.meta.path.func;
+      }
+
+      if (pathFunc) {
+        // Draw the path trace
+        ctx.beginPath();
+        ctx.strokeStyle = isSelected ? 'rgba(0, 255, 100, 0.7)' : 'rgba(100, 255, 150, 0.15)';
+        ctx.lineWidth = isSelected ? 3 : 1;
+
+        let firstPoint = true;
+        const sampleCount = 100;
+        const tmin = pathFunc.tmin !== undefined ? pathFunc.tmin : -10;
+        const tmax = pathFunc.tmax !== undefined ? pathFunc.tmax : 10;
+
+        for (let i = 0; i < sampleCount; i++) {
+          const t = tmin + (tmax - tmin) * (i / (sampleCount - 1));
+          try {
+            const p = pathFunc.positionAt(t);
+            // Offset by tower position (since paths are relative to tower)
+            const worldX = p.x + s.x;
+            const worldY = p.y + s.y;
+            const sc = worldToScreen(worldX, worldY);
+
+            if (firstPoint) {
+              ctx.moveTo(sc.x, sc.y);
+              firstPoint = false;
+            } else {
+              ctx.lineTo(sc.x, sc.y);
+            }
+          } catch(e) {}
+        }
+        ctx.stroke();
+      }
+    } else if (s.type === 'mortar') {
+      // For mortars, draw a faint green circle showing their range
+      const sc = worldToScreen(s.x, s.y);
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(100, 255, 150, 0.15)';
+      ctx.lineWidth = 1;
+      ctx.arc(sc.x, sc.y, CONFIG.mortarRadius * CONFIG.gridSizePx, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
 }
 
 // ---------- Input & UI handling ----------
@@ -638,19 +710,23 @@ canvas.addEventListener('click', (ev)=>{
   const rect = canvas.getBoundingClientRect();
   const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
   const wpos = screenToWorld(sx, sy);
-  const snapped = snapToGrid(wpos.x, wpos.y);
 
   if (currentTool === 'place-fire') {
+    const snapped = snapToGrid(wpos.x, wpos.y, 1, 1);
     if (canPlaceAt(snapped.x, snapped.y, 1, 1)) {
       const tower = createStructure('fire-control', snapped.x, snapped.y, { w:1, h:1, meta:{ path: null }});
       log('Placed fire control at ' + snapped.x + ',' + snapped.y);
     } else log('Cannot place there');
   } else if (currentTool === 'place-depot') {
+    const snapped = snapToGrid(wpos.x, wpos.y, 2, 2);
     if (canPlaceAt(snapped.x, snapped.y, 2, 2)) {
-      createStructure('depot', snapped.x, snapped.y, { w:2, h:2 });
-      log('Placed depot at ' + snapped.x + ',' + snapped.y);
+      const depot = createStructure('depot', snapped.x, snapped.y, { w:2, h:2 });
+      // Spawn a harvester at this depot
+      spawnHarvester(snapped.x + 1.5, snapped.y, depot);
+      log('Placed depot at ' + snapped.x + ',' + snapped.y + ' with harvester');
     } else log('Cannot place depot there');
   } else if (currentTool === 'place-mortar') {
+    const snapped = snapToGrid(wpos.x, wpos.y, 1, 1);
     if (canPlaceAt(snapped.x, snapped.y, 1, 1)) {
       createStructure('mortar', snapped.x, snapped.y, { w:1,h:1 });
       log('Placed mortar at ' + snapped.x + ',' + snapped.y);
@@ -660,7 +736,7 @@ canvas.addEventListener('click', (ev)=>{
     let removed=false;
     for (let i=World.structures.length-1;i>=0;i--) {
       const s = World.structures[i];
-      if (Math.abs(s.x - snapped.x) <= s.w/2 && Math.abs(s.y - snapped.y) <= s.h/2) {
+      if (Math.abs(s.x - wpos.x) <= s.w/2 && Math.abs(s.y - wpos.y) <= s.h/2) {
         World.structures.splice(i,1);
         log('Removed structure ' + s.type + ' at ' + s.x + ',' + s.y);
         removed=true; break;
@@ -672,7 +748,7 @@ canvas.addEventListener('click', (ev)=>{
     // select structure
     let clicked=null;
     for (let s of World.structures) {
-      if (Math.abs(s.x - snapped.x) <= s.w/2 && Math.abs(s.y - snapped.y) <= s.h/2) { clicked = s; break; }
+      if (Math.abs(s.x - wpos.x) <= s.w/2 && Math.abs(s.y - wpos.y) <= s.h/2) { clicked = s; break; }
     }
     if (clicked && clicked.type === 'fire-control') {
       selectedTower = clicked;
@@ -680,6 +756,7 @@ canvas.addEventListener('click', (ev)=>{
       refreshPathEditorFromSelected();
     } else if (clicked && clicked.type === 'mortar') {
       // direct mortar fire: click to fire at location (confirm)
+      const snapped = snapToGrid(wpos.x, wpos.y, 1, 1);
       fireMortarAt(snapped.x, snapped.y);
     }
   }
