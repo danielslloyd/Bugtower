@@ -243,7 +243,7 @@ function makePathHyperbola(a,b,h,k,tmin=0.1,tmax=5) {
 }
 
 // Ellipse parametric: x = h + a cos(t), y = k + b sin(t)
-function makePathEllipse(a,b,h,k,tmin=0,tmax:undefined) {
+function makePathEllipse(a,b,h,k,tmin=0,tmax=undefined) {
   return {
     positionAt: (t) => ({ x: h + a*Math.cos(t), y: k + b*Math.sin(t) }),
     tmin: 0, tmax: 2*Math.PI
