@@ -34,8 +34,8 @@
     </div>
 
     <hr/>
-    <h2 style="font-size:14px;margin-top:8px;">Selected Fire Control Tower</h2>
-    <div class="muted">Fire equation: y = ax + b</div>
+    <h2 style="font-size:14px;margin-top:8px;">Selected Structure</h2>
+    <div class="muted">Click a structure to edit its parameters</div>
 
     <div id="path-params" style="margin-top:8px;">
       <!-- Dynamic parameter inputs will be injected here -->
@@ -81,6 +81,10 @@ const CONFIG = {
   maxSamplePoints: 200,
   originAttractionWeight: 2.5, // must be > sum repulsions to ensure attraction dominates
   repulsionDecay: 8.0,         // higher -> more localized death spot repulsion
+  minPullPushRatio: 1.03,      // ensures pull always dominates push
+  pullLinearMod: 0.001,        // linear component of pull force
+  pathCalcStep: 5,             // bugs recalculate path every N frames
+  pullOverrideRange: 200,      // range within which pull force is boosted
   harvesterSpeed: 0.8,         // units/sec (nerfed by 0.2x from 4.0)
   bugSpeedMin: 0.6,
   bugSpeedMax: 1.6,
@@ -168,11 +172,12 @@ function canPlaceAt(x,y,w=1,h=1) {
     // overlapping base — allow structures only if not inside the base? We'll disallow for now.
     return false;
   }
-  // avoid overlapping with other structures
+  // avoid overlapping with other structures (allow touching edges)
   for (let s of World.structures) {
     const sw = s.w, sh = s.h;
     const sleft = s.x - sw/2, sright = s.x + sw/2, sbottom = s.y - sh/2, stop = s.y + sh/2;
-    if (!(right < sleft || left > sright || top < sbottom || bottom > stop)) return false;
+    // Use <= to allow touching edges but not overlapping
+    if (!(right <= sleft || left >= sright || top <= sbottom || bottom >= stop)) return false;
   }
   return true;
 }
@@ -185,7 +190,18 @@ function createStructure(type, x, y, opts={}) {
 }
 function spawnBug(x,y) {
   const speed = Math.random()*(CONFIG.bugSpeedMax - CONFIG.bugSpeedMin) + CONFIG.bugSpeedMin;
-  const b = { id: 'b' + (Math.random()*1e6|0), x,y, hp: 10, speed, alive: true, rotation:0 };
+  const b = {
+    id: 'b' + (Math.random()*1e6|0),
+    x, y,
+    hp: 10,
+    speed,
+    alive: true,
+    rotation: 0,
+    dx: 0, dy: 0,           // velocity
+    pullX: 0, pullY: 0,     // pull force (attraction to origin)
+    pushX: 0, pushY: 0,     // push force (repulsion from death spots)
+    pathStep: World.ticks % CONFIG.pathCalcStep  // offset for path recalculation
+  };
   World.bugs.push(b);
   return b;
 }
@@ -274,33 +290,70 @@ function validatePath(pathObj, sampleCount=60) {
   return { ok:true };
 }
 
-// ---------- Bug AI: attraction to origin, repulsion from deathSpots ----------
+// ---------- Bug AI: push/pull pathfinding adapted from example.html ----------
 function updateBug(b, dt) {
-  // compute vector towards origin
-  const toOrigin = { x: -b.x, y: -b.y };
-  let forceX = CONFIG.originAttractionWeight * toOrigin.x;
-  let forceY = CONFIG.originAttractionWeight * toOrigin.y;
+  // Recalculate path only every pathCalcStep frames (performance optimization)
+  if (World.ticks % CONFIG.pathCalcStep === b.pathStep) {
+    // Calculate pull force (attraction to origin/base)
+    const distToOrigin = Math.hypot(b.x, b.y) + 1e-6;
+    b.pullX = (CONFIG.pullLinearMod * (-b.x) / distToOrigin) + (-b.x) / (distToOrigin * distToOrigin);
+    b.pullY = (CONFIG.pullLinearMod * (-b.y) / distToOrigin) + (-b.y) / (distToOrigin * distToOrigin);
 
-  // add repulsion from death spots
-  for (let d of World.deathSpots) {
-    const dx = b.x - d.x, dy = b.y - d.y;
-    const dist2 = dx*dx + dy*dy + 1e-6;
-    const repulsion = (d.amount || 1) / (dist2 * CONFIG.repulsionDecay);
-    forceX += repulsion * dx;
-    forceY += repulsion * dy;
+    // Scale pull by bug count (more bugs = stronger pull to keep them moving)
+    const bugCount = World.bugs.filter(bug => bug.alive).length;
+    const bugScaling = 1 + bugCount / 700;
+    b.pullX *= bugScaling;
+    b.pullY *= bugScaling;
+
+    // Calculate push force (repulsion from death spots)
+    b.pushX = 0;
+    b.pushY = 0;
+    for (let d of World.deathSpots) {
+      if ((d.amount || 0) <= 0) continue;
+      const dx = b.x - d.x;
+      const dy = b.y - d.y;
+      const dist2 = dx*dx + dy*dy + 1e-6;
+      const pushStrength = (d.amount || 1) / dist2;
+      b.pushX += pushStrength * dx;
+      b.pushY += pushStrength * dy;
+    }
+
+    // Balance pull/push forces - ensure pull always dominates
+    let pullMod = Math.max(1, CONFIG.pullOverrideRange / distToOrigin);
+    const magPush = Math.hypot(b.pushX, b.pushY);
+    const magPull = Math.hypot(b.pullX, b.pullY);
+
+    if (magPush > 0 && magPull / magPush <= CONFIG.minPullPushRatio) {
+      pullMod *= CONFIG.minPullPushRatio * magPush / magPull;
+    }
+
+    b.pullX *= pullMod;
+    b.pullY *= pullMod;
+
+    // Combine forces
+    b.dx = b.pullX + b.pushX;
+    b.dy = b.pullY + b.pushY;
+
+    // Normalize to constant speed
+    const mag = Math.hypot(b.dx, b.dy);
+    if (mag > 0) {
+      b.dx = (b.dx / mag) * b.speed;
+      b.dy = (b.dy / mag) * b.speed;
+    }
   }
-  // normalize direction
-  const dir = normalize(forceX, forceY);
-  b.x += dir.x * b.speed * dt;
-  b.y += dir.y * b.speed * dt;
-  b.rotation = Math.atan2(dir.y, dir.x);
+
+  // Apply velocity
+  b.x += b.dx * dt;
+  b.y += b.dy * dt;
+  b.rotation = Math.atan2(b.dy, b.dx);
+
   // Check arrival at base (base is 2x2 centered at origin)
   const half = CONFIG.baseSize / 2;
   if (b.x > -half && b.x < half && b.y > -half && b.y < half) {
     b.alive = false;
     World.baseHealth = Math.max(0, World.baseHealth - 6);
     log('Bug hit base! Base health: ' + World.baseHealth);
-    World.deathSpots.push({ x: b.x, y: b.y, amount: 0.5 });
+    World.deathSpots.push({ x: b.x, y: b.y, amount: 1.0 });
   }
 }
 
@@ -475,6 +528,17 @@ function gameTick(dt) {
 
         spawnPlane(pf, offScreenStart, 12, s.id);
         log('Plane incoming along path from fire control tower');
+      }
+    } else if (s.type === 'mortar' && s.meta) {
+      // Auto-fire mortars at their target coordinates
+      if (!s.meta.fireTimer) s.meta.fireTimer = 0;
+      s.meta.fireTimer += dt;
+      const interval = s.meta.fireInterval || 3.0;
+      if (s.meta.fireTimer >= interval) {
+        s.meta.fireTimer = 0;
+        const targetX = s.meta.targetX || 0;
+        const targetY = s.meta.targetY || 0;
+        fireMortarAt(targetX, targetY);
       }
     }
   }
@@ -780,10 +844,10 @@ function renderFireTraces() {
       }
 
       if (pathFunc) {
-        // Draw the path trace
+        // Draw the path trace - all paths visible, selected path is bolder
         ctx.beginPath();
-        ctx.strokeStyle = isSelected ? 'rgba(0, 255, 100, 0.7)' : 'rgba(100, 255, 150, 0.15)';
-        ctx.lineWidth = isSelected ? 3 : 1;
+        ctx.strokeStyle = isSelected ? 'rgba(0, 255, 100, 0.8)' : 'rgba(0, 255, 100, 0.4)';
+        ctx.lineWidth = isSelected ? 3 : 1.5;
 
         let firstPoint = true;
         const sampleCount = 100;
@@ -837,17 +901,44 @@ function renderFireTraces() {
             ctx.fillRect(endScreen.x - markerSize/2, endScreen.y - markerSize/2, markerSize, markerSize);
             ctx.strokeRect(endScreen.x - markerSize/2, endScreen.y - markerSize/2, markerSize, markerSize);
 
-            // Draw bounding box connecting the two points
-            const minX = Math.min(startScreen.x, endScreen.x);
-            const maxX = Math.max(startScreen.x, endScreen.x);
-            const minY = Math.min(startScreen.y, endScreen.y);
-            const maxY = Math.max(startScreen.y, endScreen.y);
+            // Calculate path angle and draw rotated bounding box
+            const dx = endWorld.x - startWorld.x;
+            const dy = endWorld.y - startWorld.y;
+            const angle = Math.atan2(dy, dx);
+
+            // Calculate bounding box dimensions perpendicular to path
+            // Sample multiple points to find max perpendicular distance
+            let maxPerpDist = 0;
+            const pathLength = Math.hypot(dx, dy);
+            const sampleCount = 20;
+            for (let i = 0; i < sampleCount; i++) {
+              const t = tmin + (tmax - tmin) * (i / (sampleCount - 1));
+              const p = pathFunc.positionAt(t);
+              // Calculate perpendicular distance from path line
+              const px = p.x - startWorld.x;
+              const py = p.y - startWorld.y;
+              const perpDist = Math.abs(px * Math.sin(angle) - py * Math.cos(angle));
+              maxPerpDist = Math.max(maxPerpDist, perpDist);
+            }
+
+            // Add some padding to the box width
+            const boxWidth = Math.max(0.5, maxPerpDist * 2);
+
+            // Draw rotated rectangle
+            ctx.save();
+            ctx.translate((startScreen.x + endScreen.x) / 2, (startScreen.y + endScreen.y) / 2);
+            ctx.rotate(-angle); // Negative because screen Y is inverted
+
+            const rectLength = pathLength * CONFIG.gridSizePx;
+            const rectWidth = boxWidth * CONFIG.gridSizePx;
 
             ctx.strokeStyle = 'rgba(0, 255, 0, 0.5)';
             ctx.lineWidth = 2;
             ctx.setLineDash([5, 5]);
-            ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
+            ctx.strokeRect(-rectLength / 2, -rectWidth / 2, rectLength, rectWidth);
             ctx.setLineDash([]); // Reset line dash
+
+            ctx.restore();
 
             // Draw labels
             ctx.fillStyle = 'rgba(0, 255, 0, 1)';
@@ -865,6 +956,49 @@ function renderFireTraces() {
       ctx.lineWidth = 1;
       ctx.arc(sc.x, sc.y, CONFIG.mortarRadius * CONFIG.gridSizePx, 0, Math.PI * 2);
       ctx.stroke();
+
+      // Draw target position as a green circle
+      if (s.meta && (s.meta.targetX !== undefined || s.meta.targetY !== undefined)) {
+        const targetX = s.meta.targetX || 0;
+        const targetY = s.meta.targetY || 0;
+        const targetSc = worldToScreen(targetX, targetY);
+
+        // Draw filled green circle for target
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(0, 255, 0, 0.3)';
+        ctx.arc(targetSc.x, targetSc.y, CONFIG.mortarRadius * CONFIG.gridSizePx, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Draw green border
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(0, 255, 0, 0.8)';
+        ctx.lineWidth = 2;
+        ctx.arc(targetSc.x, targetSc.y, CONFIG.mortarRadius * CONFIG.gridSizePx, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Draw crosshair at center
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(0, 255, 0, 1)';
+        ctx.lineWidth = 2;
+        const crosshairSize = 8;
+        ctx.moveTo(targetSc.x - crosshairSize, targetSc.y);
+        ctx.lineTo(targetSc.x + crosshairSize, targetSc.y);
+        ctx.moveTo(targetSc.x, targetSc.y - crosshairSize);
+        ctx.lineTo(targetSc.x, targetSc.y + crosshairSize);
+        ctx.stroke();
+
+        // Draw line from mortar to target if mortar is selected
+        if (s === selectedMortar) {
+          ctx.beginPath();
+          ctx.strokeStyle = 'rgba(0, 255, 0, 0.4)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([5, 5]);
+          ctx.moveTo(sc.x, sc.y);
+          ctx.lineTo(targetSc.x, targetSc.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
     }
   }
 }
@@ -936,7 +1070,15 @@ canvas.addEventListener('click', (ev)=>{
   } else if (currentTool === 'place-mortar') {
     const snapped = snapToGrid(wpos.x, wpos.y, 1, 1);
     if (canPlaceAt(snapped.x, snapped.y, 1, 1)) {
-      createStructure('mortar', snapped.x, snapped.y, { w:1,h:1 });
+      createStructure('mortar', snapped.x, snapped.y, {
+        w:1, h:1,
+        meta: {
+          targetX: 0,
+          targetY: 0,
+          fireInterval: 3.0,  // fire every 3 seconds
+          fireTimer: 0
+        }
+      });
       log('Placed mortar at ' + snapped.x + ',' + snapped.y);
       currentTool = null; // Auto-switch to selection mode
       previewPos = null; // Clear preview
@@ -962,19 +1104,28 @@ canvas.addEventListener('click', (ev)=>{
     }
     if (clicked && clicked.type === 'fire-control') {
       selectedTower = clicked;
+      selectedMortar = null;
       log('Selected fire-control tower at ' + clicked.x + ',' + clicked.y);
       refreshPathEditorFromSelected();
     } else if (clicked && clicked.type === 'mortar') {
-      // direct mortar fire: click to fire at location (confirm)
-      const snapped = snapToGrid(wpos.x, wpos.y, 1, 1);
-      fireMortarAt(snapped.x, snapped.y);
+      selectedMortar = clicked;
+      selectedTower = null;
+      log('Selected mortar pit at ' + clicked.x + ',' + clicked.y);
+      refreshMortarEditorFromSelected();
+    } else {
+      // Deselect if clicking empty space
+      selectedTower = null;
+      selectedMortar = null;
+      refreshPathEditorFromSelected();
     }
   }
 });
 
 // ------------ Path editor UI ------------
 let selectedTower = null;
+let selectedMortar = null;
 let lastValidParams = { a: 1, b: 0 };
+let lastValidMortarParams = { targetX: 0, targetY: 0, fireInterval: 3.0 };
 const pathParamsDiv = document.getElementById('path-params');
 
 function createParamInput(id, label, defaultVal='') {
@@ -985,12 +1136,88 @@ function createParamInput(id, label, defaultVal='') {
 
 function refreshPathEditorFromSelected() {
   pathParamsDiv.innerHTML = '';
+  if (selectedMortar) {
+    // Show mortar UI instead
+    refreshMortarEditorFromSelected();
+    return;
+  }
   if (!selectedTower) {
     pathParamsDiv.innerHTML = '<div class="muted">No fire-control tower selected.</div>';
     return;
   }
   const pt = selectedTower.meta.path || { type: 'simple', params: { a: 1, b: 0 } };
   buildParamInputs(pt.params);
+}
+
+function refreshMortarEditorFromSelected() {
+  pathParamsDiv.innerHTML = '';
+  if (!selectedMortar) {
+    pathParamsDiv.innerHTML = '<div class="muted">No mortar pit selected.</div>';
+    return;
+  }
+  // Update the sidebar title
+  const meta = selectedMortar.meta || { targetX: 0, targetY: 0, fireInterval: 3.0 };
+  buildMortarInputs(meta);
+}
+
+function buildMortarInputs(existingParams={}) {
+  pathParamsDiv.innerHTML = '';
+  pathParamsDiv.innerHTML = '<div class="muted">Mortar target coordinates (world space):</div>';
+  pathParamsDiv.appendChild(createParamInput('m_targetX', 'Target X', existingParams.targetX || '0'));
+  pathParamsDiv.appendChild(createParamInput('m_targetY', 'Target Y', existingParams.targetY || '0'));
+  pathParamsDiv.appendChild(createParamInput('m_fireInterval', 'Fire Interval (seconds)', existingParams.fireInterval || '3.0'));
+
+  const inputX = document.getElementById('m_targetX');
+  const inputY = document.getElementById('m_targetY');
+  const inputInterval = document.getElementById('m_fireInterval');
+
+  const updateMortar = () => {
+    if (!selectedMortar) return;
+
+    const targetX = parseFloat(inputX.value);
+    const targetY = parseFloat(inputY.value);
+    const fireInterval = parseFloat(inputInterval.value);
+
+    // Validate inputs
+    if (!isFinite(targetX) || !isFinite(targetY) || !isFinite(fireInterval) ||
+        isNaN(targetX) || isNaN(targetY) || isNaN(fireInterval) || fireInterval <= 0) {
+      // Revert to last valid values
+      inputX.value = lastValidMortarParams.targetX;
+      inputY.value = lastValidMortarParams.targetY;
+      inputInterval.value = lastValidMortarParams.fireInterval;
+      log('Invalid mortar input - reverted to last valid values');
+      return;
+    }
+
+    // Update the mortar's meta
+    selectedMortar.meta.targetX = targetX;
+    selectedMortar.meta.targetY = targetY;
+    selectedMortar.meta.fireInterval = fireInterval;
+    lastValidMortarParams = { targetX, targetY, fireInterval };
+    log('Mortar target updated: (' + targetX.toFixed(1) + ', ' + targetY.toFixed(1) + '), interval: ' + fireInterval.toFixed(1) + 's');
+  };
+
+  // Only validate on blur or Enter key
+  inputX.addEventListener('blur', updateMortar);
+  inputY.addEventListener('blur', updateMortar);
+  inputInterval.addEventListener('blur', updateMortar);
+
+  inputX.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { updateMortar(); inputX.blur(); }
+  });
+  inputY.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { updateMortar(); inputY.blur(); }
+  });
+  inputInterval.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { updateMortar(); inputInterval.blur(); }
+  });
+
+  // Store initial valid params
+  lastValidMortarParams = {
+    targetX: existingParams.targetX || 0,
+    targetY: existingParams.targetY || 0,
+    fireInterval: existingParams.fireInterval || 3.0
+  };
 }
 
 function buildParamInputs(existingParams={}) {
