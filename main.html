@@ -30,7 +30,6 @@
       <div class="tool" id="tool-place-tower">Place: Fire Control Tower (1×1)</div>
       <div class="tool" id="tool-place-depot">Place: Depot / Silo (2×2)</div>
       <div class="tool" id="tool-place-mortar">Place: Mortar Pit (1×1)</div>
-      <div class="tool" id="tool-place-harvester">Spawn Harvester</div>
       <div class="tool" id="tool-remove">Remove Structure</div>
     </div>
 
@@ -354,16 +353,31 @@ function updateHarvester(h, dt) {
 
 // ---------- Plane behavior (airstrike) ----------
 function updatePlane(p, dt) {
-  p.t += dt * CONFIG.planeSpeed;
-  // get position from param
-  const pos = p.pathFunc.positionAt(p.t);
-  // drop bombs at intervals or based on some condition
-  if (!p._nextDrop) p._nextDrop = 0;
-  p._nextDrop -= dt;
-  if (p._nextDrop <= 0) {
-    spawnBomb(pos.x, pos.y);
-    p._nextDrop = 0.8; // seconds between bomb drops
+  // Initialize bomb counter and drop tracking
+  if (p._bombsDropped === undefined) p._bombsDropped = 0;
+  if (p._bombDropPositions === undefined) {
+    // Calculate 10 evenly spaced bomb drop positions within the box (tmin to tmax)
+    const tmin = p.pathFunc.tmin !== undefined ? p.pathFunc.tmin : -10;
+    const tmax = p.pathFunc.tmax !== undefined ? p.pathFunc.tmax : 10;
+    p._bombDropPositions = [];
+    for (let i = 0; i < 10; i++) {
+      const dropT = tmin + (tmax - tmin) * (i / 9); // 10 bombs evenly spaced from tmin to tmax
+      p._bombDropPositions.push(dropT);
+    }
   }
+
+  p.t += dt * CONFIG.planeSpeed;
+
+  // Check if plane has passed any bomb drop position
+  if (p._bombsDropped < 10) {
+    const nextDropT = p._bombDropPositions[p._bombsDropped];
+    if (p.t >= nextDropT) {
+      const pos = p.pathFunc.positionAt(p.t);
+      spawnBomb(pos.x, pos.y);
+      p._bombsDropped++;
+    }
+  }
+
   p.lifetime -= dt;
   if (p.lifetime <= 0) p.alive = false;
 }
@@ -451,17 +465,16 @@ function gameTick(dt) {
       s.meta.launchTimer += dt;
       if (s.meta.launchTimer >= 10) {
         s.meta.launchTimer = 0;
-        // Launch a plane
+        // Launch a plane from outside the viewing window
+        // Coordinates are relative to origin, not the tower
         const pf = s.meta.path.func;
-        const wrapper = {
-          positionAt: (t) => {
-            const p = pf.positionAt(t);
-            return { x: p.x + s.x, y: p.y + s.y };
-          },
-          tmin: pf.tmin, tmax: pf.tmax
-        };
-        spawnPlane(wrapper, 0, 12, s.id);
-        log('Auto-launched from tower at (' + s.x + ', ' + s.y + ')');
+
+        // Calculate start position outside the viewing window (left edge)
+        // Use worldWidth to ensure plane starts off-screen
+        const offScreenStart = -CONFIG.worldWidth/2 - 5; // 5 units outside left edge
+
+        spawnPlane(pf, offScreenStart, 12, s.id);
+        log('Plane incoming along path from fire control tower');
       }
     }
   }
@@ -781,10 +794,8 @@ function renderFireTraces() {
           const t = tmin + (tmax - tmin) * (i / (sampleCount - 1));
           try {
             const p = pathFunc.positionAt(t);
-            // Offset by tower position (since paths are relative to tower)
-            const worldX = p.x + s.x;
-            const worldY = p.y + s.y;
-            const sc = worldToScreen(worldX, worldY);
+            // Coordinates are relative to origin, not tower
+            const sc = worldToScreen(p.x, p.y);
 
             if (firstPoint) {
               ctx.moveTo(sc.x, sc.y);
@@ -803,17 +814,17 @@ function renderFireTraces() {
             const startPos = pathFunc.positionAt(tmin);
             const endPos = pathFunc.positionAt(tmax);
 
-            // Convert to world coordinates (offset by tower position)
-            const startWorld = { x: startPos.x + s.x, y: startPos.y + s.y };
-            const endWorld = { x: endPos.x + s.x, y: endPos.y + s.y };
+            // Coordinates are relative to origin
+            const startWorld = startPos;
+            const endWorld = endPos;
 
             // Convert to screen coordinates
             const startScreen = worldToScreen(startWorld.x, startWorld.y);
             const endScreen = worldToScreen(endWorld.x, endWorld.y);
 
             // Draw target box markers at start and end
-            ctx.strokeStyle = 'rgba(255, 255, 0, 0.8)';
-            ctx.fillStyle = 'rgba(255, 255, 0, 0.3)';
+            ctx.strokeStyle = 'rgba(0, 255, 0, 0.8)';
+            ctx.fillStyle = 'rgba(0, 255, 0, 0.3)';
             ctx.lineWidth = 2;
 
             const markerSize = 12;
@@ -832,14 +843,14 @@ function renderFireTraces() {
             const minY = Math.min(startScreen.y, endScreen.y);
             const maxY = Math.max(startScreen.y, endScreen.y);
 
-            ctx.strokeStyle = 'rgba(255, 255, 0, 0.5)';
+            ctx.strokeStyle = 'rgba(0, 255, 0, 0.5)';
             ctx.lineWidth = 2;
             ctx.setLineDash([5, 5]);
             ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
             ctx.setLineDash([]); // Reset line dash
 
             // Draw labels
-            ctx.fillStyle = 'rgba(255, 255, 0, 1)';
+            ctx.fillStyle = 'rgba(0, 255, 0, 1)';
             ctx.font = 'bold 11px sans-serif';
             ctx.fillText('t=' + tmin.toFixed(1), startScreen.x + 8, startScreen.y - 8);
             ctx.fillText('t=' + tmax.toFixed(1), endScreen.x + 8, endScreen.y - 8);
@@ -864,9 +875,6 @@ let previewPos = null; // Store preview position for mousemove
 document.getElementById('tool-place-tower').addEventListener('click', ()=>{ currentTool = 'place-fire'; log('Tool: place fire-control'); });
 document.getElementById('tool-place-depot').addEventListener('click', ()=>{ currentTool = 'place-depot'; log('Tool: place depot'); });
 document.getElementById('tool-place-mortar').addEventListener('click', ()=>{ currentTool = 'place-mortar'; log('Tool: place mortar'); });
-document.getElementById('tool-place-harvester').addEventListener('click', ()=>{ // spawn harvester near base
-  spawnHarvester(2.5,0.5);
-  log('Harvester spawned'); });
 document.getElementById('tool-remove').addEventListener('click', ()=>{ currentTool = 'remove'; log('Tool: remove'); });
 
 // Mousemove handler for placement preview
