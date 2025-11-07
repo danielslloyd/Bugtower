@@ -144,6 +144,7 @@ const World = {
   harvesters: [],    // harvesters with state
   planes: [],        // active planes (airstrike)
   bombs: [],         // active bombs (from planes)
+  xpPopups: [],      // XP popups {x,y,text,life,maxLife}
   ticks: 0,
   resourceCount: 0,
   baseHealth: CONFIG.baseHealth
@@ -184,7 +185,22 @@ function canPlaceAt(x,y,w=1,h=1) {
 
 // ---------- Entities constructors ----------
 function createStructure(type, x, y, opts={}) {
-  const s = { id: 's' + (Math.random()*1e6|0), type, x,y, w: opts.w||1, h: opts.h||1, meta: opts.meta||{} };
+  // Determine max HP based on structure type
+  let maxHp = 100;
+  if (type === 'fire-control') maxHp = 100;
+  else if (type === 'depot') maxHp = 200;
+  else if (type === 'mortar') maxHp = 80;
+
+  const s = {
+    id: 's' + (Math.random()*1e6|0),
+    type, x, y,
+    w: opts.w||1,
+    h: opts.h||1,
+    meta: opts.meta||{},
+    hp: maxHp,
+    maxHp: maxHp,
+    xp: 0  // Experience points for kills
+  };
   World.structures.push(s);
   return s;
 }
@@ -218,8 +234,12 @@ function spawnPlane(pathFunc, t0=0, lifetime=10, towerRef=null) {
   World.planes.push(p);
   return p;
 }
-function spawnBomb(x,y,damage=CONFIG.bombDamage, radius=CONFIG.bombRadius) {
-  World.bombs.push({ id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6, maxLife: 0.6 }); // short explosion life
+function spawnBomb(x,y,damage=CONFIG.bombDamage, radius=CONFIG.bombRadius, sourceStructure=null) {
+  World.bombs.push({ id:'bom'+(Math.random()*1e6|0), x,y, damage, radius, life: 0.6, maxLife: 0.6, sourceStructure }); // short explosion life
+}
+
+function spawnXPPopup(x, y, xp) {
+  World.xpPopups.push({ x, y, text: '+' + xp + 'XP', life: 1.5, maxLife: 1.5 });
 }
 
 // ---------- Path templates and parameter handling ----------
@@ -419,14 +439,29 @@ function updatePlane(p, dt) {
     }
   }
 
-  p.t += dt * CONFIG.planeSpeed;
+  // Calculate derivative of path to get direction
+  const currentPos = p.pathFunc.positionAt(p.t);
+  const epsilon = 0.01;
+  const nextPos = p.pathFunc.positionAt(p.t + epsilon);
+
+  // Calculate path tangent (direction of motion)
+  const dx = nextPos.x - currentPos.x;
+  const dy = nextPos.y - currentPos.y;
+  const pathLength = Math.hypot(dx, dy);
+
+  // Move at constant groundspeed (CONFIG.planeSpeed units per second)
+  // dt_param = groundspeed * dt / path_length
+  const dtParam = (CONFIG.planeSpeed * dt) / (pathLength / epsilon);
+  p.t += dtParam;
 
   // Check if plane has passed any bomb drop position
   if (p._bombsDropped < 10) {
     const nextDropT = p._bombDropPositions[p._bombsDropped];
     if (p.t >= nextDropT) {
       const pos = p.pathFunc.positionAt(p.t);
-      spawnBomb(pos.x, pos.y);
+      // Find source structure for this plane
+      const sourceStructure = World.structures.find(s => s.id === p.towerRef);
+      spawnBomb(pos.x, pos.y, CONFIG.bombDamage, CONFIG.bombRadius, sourceStructure);
       p._bombsDropped++;
     }
   }
@@ -451,14 +486,26 @@ function resolveBombDamage(bomb) {
     const d = vecLen(bug.x - bomb.x, bug.y - bomb.y);
     if (d <= bomb.radius) {
       bug.hp -= bomb.damage;
-      if (bug.hp <= 0) { bug.alive = false; World.deathSpots.push({ x: bug.x, y: bug.y, amount: 1.0 }); victims.push(bug.id); }
+      if (bug.hp <= 0) {
+        bug.alive = false;
+        World.deathSpots.push({ x: bug.x, y: bug.y, amount: 1.0 });
+        victims.push(bug.id);
+      }
     }
   }
-  if (victims.length) log('Bomb killed ' + victims.length + ' bugs');
+  if (victims.length) {
+    log('Bomb killed ' + victims.length + ' bugs');
+    // Award XP to source structure
+    if (bomb.sourceStructure) {
+      const xpGained = victims.length * 10; // 10 XP per kill
+      bomb.sourceStructure.xp += xpGained;
+      spawnXPPopup(bomb.sourceStructure.x, bomb.sourceStructure.y, xpGained);
+    }
+  }
 }
 
 // ---------- Mortar firing ----------
-function fireMortarAt(x,y) {
+function fireMortarAt(x, y, sourceStructure=null) {
   // immediate effect: damage all bugs within radius
   let count=0;
   for (let bug of World.bugs) {
@@ -466,10 +513,22 @@ function fireMortarAt(x,y) {
     const d = vecLen(bug.x - x, bug.y - y);
     if (d <= CONFIG.mortarRadius) {
       bug.hp -= CONFIG.mortarDamage;
-      if (bug.hp <= 0) { bug.alive=false; World.deathSpots.push({ x: bug.x, y: bug.y, amount: 1.0 }); count++; }
+      if (bug.hp <= 0) {
+        bug.alive=false;
+        World.deathSpots.push({ x: bug.x, y: bug.y, amount: 1.0 });
+        count++;
+      }
     }
   }
-  log('Mortar hit: ' + count + ' killed');
+  if (count > 0) {
+    log('Mortar hit: ' + count + ' killed');
+    // Award XP to source structure
+    if (sourceStructure) {
+      const xpGained = count * 10; // 10 XP per kill
+      sourceStructure.xp += xpGained;
+      spawnXPPopup(sourceStructure.x, sourceStructure.y, xpGained);
+    }
+  }
 }
 
 // ---------- Game loop ----------
@@ -538,7 +597,7 @@ function gameTick(dt) {
         s.meta.fireTimer = 0;
         const targetX = s.meta.targetX || 0;
         const targetY = s.meta.targetY || 0;
-        fireMortarAt(targetX, targetY);
+        fireMortarAt(targetX, targetY, s);
       }
     }
   }
@@ -557,6 +616,12 @@ function gameTick(dt) {
   }
   // remove dead planes
   for (let i=World.planes.length-1;i>=0;i--) if (!World.planes[i].alive) World.planes.splice(i,1);
+  // update XP popups
+  for (let i=World.xpPopups.length-1;i>=0;i--) {
+    const popup = World.xpPopups[i];
+    popup.life -= dt;
+    if (popup.life <= 0) World.xpPopups.splice(i,1);
+  }
   // base health check
   document.getElementById('base-health').textContent = Math.max(0, Math.round(World.baseHealth));
   document.getElementById('bug-count').textContent = World.bugs.length;
@@ -669,6 +734,51 @@ function renderEntities() {
       ctx.strokeStyle = '#4d1515'; ctx.strokeRect(tl.x, tl.y, w, h);
       ctx.fillStyle = '#fff'; ctx.fillText('M', tl.x + 4, tl.y + 14);
     }
+
+    // Draw HP bar above structure
+    const hpBarWidth = w;
+    const hpBarHeight = 4;
+    const hpBarY = tl.y - 8;
+    const hpPercent = s.hp / s.maxHp;
+
+    // Background (gray)
+    ctx.fillStyle = '#333';
+    ctx.fillRect(tl.x, hpBarY, hpBarWidth, hpBarHeight);
+
+    // HP fill (green to red gradient)
+    if (hpPercent > 0.5) {
+      ctx.fillStyle = '#4CAF50'; // green
+    } else if (hpPercent > 0.25) {
+      ctx.fillStyle = '#FFC107'; // yellow
+    } else {
+      ctx.fillStyle = '#F44336'; // red
+    }
+    ctx.fillRect(tl.x, hpBarY, hpBarWidth * hpPercent, hpBarHeight);
+
+    // HP bar border
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(tl.x, hpBarY, hpBarWidth, hpBarHeight);
+  }
+
+  // Draw XP popups
+  for (let popup of World.xpPopups) {
+    const sc = worldToScreen(popup.x, popup.y);
+    const progress = 1 - (popup.life / popup.maxLife);
+
+    // Float upward and fade out
+    const offsetY = -30 - (progress * 20); // Move up 20 pixels over lifetime
+    const opacity = 1 - progress; // Fade out
+
+    ctx.save();
+    ctx.globalAlpha = opacity;
+    ctx.fillStyle = '#FFD700'; // Gold color
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    ctx.font = 'bold 16px sans-serif';
+    ctx.strokeText(popup.text, sc.x, sc.y + offsetY);
+    ctx.fillText(popup.text, sc.x, sc.y + offsetY);
+    ctx.restore();
   }
 
   // resources
@@ -870,6 +980,37 @@ function renderFireTraces() {
           } catch(e) {}
         }
         ctx.stroke();
+
+        // Draw perpendicular line from tower to path
+        // Find the closest point on the path to the tower
+        let closestDist = Infinity;
+        let closestPoint = null;
+        const sampleCountPerp = 100;
+        for (let i = 0; i < sampleCountPerp; i++) {
+          const t = tmin + (tmax - tmin) * (i / (sampleCountPerp - 1));
+          try {
+            const p = pathFunc.positionAt(t);
+            const dist = Math.hypot(p.x - s.x, p.y - s.y);
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestPoint = p;
+            }
+          } catch(e) {}
+        }
+
+        if (closestPoint) {
+          const towerSc = worldToScreen(s.x, s.y);
+          const closestSc = worldToScreen(closestPoint.x, closestPoint.y);
+
+          ctx.beginPath();
+          ctx.strokeStyle = isSelected ? 'rgba(255, 255, 0, 0.7)' : 'rgba(255, 255, 0, 0.3)';
+          ctx.lineWidth = isSelected ? 2 : 1;
+          ctx.setLineDash([3, 3]);
+          ctx.moveTo(towerSc.x, towerSc.y);
+          ctx.lineTo(closestSc.x, closestSc.y);
+          ctx.stroke();
+          ctx.setLineDash([]); // Reset line dash
+        }
 
         // Highlight x limits "target box" for selected tower
         if (isSelected) {
